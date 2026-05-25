@@ -463,6 +463,9 @@ const BOOLEAN_ATTRIBUTE_PART = 4;
 const EVENT_PART = 5;
 const ELEMENT_PART = 6;
 const COMMENT_PART = 7;
+const KEYED_ATTRIBUTE_PART = 8;
+
+const noKey = {};
 
 /**
  * The return type of the template tag functions, {@linkcode html} and
@@ -959,6 +962,7 @@ class Template {
   el!: HTMLTemplateElement;
 
   parts: Array<TemplatePart> = [];
+  keyedValueIndex?: number;
 
   constructor(
     // This property needs to remain unminified.
@@ -968,8 +972,14 @@ class Template {
     let node: Node | null;
     let nodeIndex = 0;
     let attrNameIndex = 0;
+    let valueIndex = 0;
     const partCount = strings.length - 1;
     const parts = this.parts;
+
+    const pushPart = (part: TemplatePart, valueCount = 1) => {
+      parts.push(part);
+      valueIndex += valueCount;
+    };
 
     // Create template element
     const [html, attrNames] = getTemplateHtml(strings, type);
@@ -1013,24 +1023,51 @@ class Template {
               const realName = attrNames[attrNameIndex++];
               const value = (node as Element).getAttribute(name)!;
               const statics = value.split(marker);
-              const m = /([.?@])?(.*)/.exec(realName)!;
-              parts.push({
-                type: ATTRIBUTE_PART,
-                index: nodeIndex,
-                name: m[2],
-                strings: statics,
-                ctor:
-                  m[1] === '.'
-                    ? PropertyPart
-                    : m[1] === '?'
-                      ? BooleanAttributePart
-                      : m[1] === '@'
-                        ? EventPart
-                        : AttributePart,
-              });
+              const m = /([.?@:])?(.*)/.exec(realName)!;
+              if (m[1] === ':' && m[2] === 'key') {
+                if (
+                  DEV_MODE &&
+                  (statics.length !== 2 ||
+                    statics[0] !== '' ||
+                    statics[1] !== '')
+                ) {
+                  throw new Error(
+                    `A \`<${(node as Element).localName}>\` has a ` +
+                      `\`:key=...\` binding with invalid content. Key ` +
+                      `bindings in templates must have exactly one ` +
+                      `expression and no surrounding text.`
+                  );
+                }
+                this.keyedValueIndex = valueIndex;
+                pushPart(
+                  {
+                    type: KEYED_ATTRIBUTE_PART,
+                    index: nodeIndex,
+                  },
+                  statics.length - 1
+                );
+              } else {
+                pushPart(
+                  {
+                    type: ATTRIBUTE_PART,
+                    index: nodeIndex,
+                    name: m[2],
+                    strings: statics,
+                    ctor:
+                      m[1] === '.'
+                        ? PropertyPart
+                        : m[1] === '?'
+                          ? BooleanAttributePart
+                          : m[1] === '@'
+                            ? EventPart
+                            : AttributePart,
+                  },
+                  statics.length - 1
+                );
+              }
               (node as Element).removeAttribute(name);
             } else if (name.startsWith(marker)) {
-              parts.push({
+              pushPart({
                 type: ELEMENT_PART,
                 index: nodeIndex,
               });
@@ -1056,7 +1093,7 @@ class Template {
               (node as Element).append(strings[i], createMarker());
               // Walk past the marker node we just added
               walker.nextNode();
-              parts.push({type: CHILD_PART, index: ++nodeIndex});
+              pushPart({type: CHILD_PART, index: ++nodeIndex});
             }
             // Note because this marker is added after the walker's current
             // node, it will be walked to in the outer loop (and ignored), so
@@ -1067,13 +1104,13 @@ class Template {
       } else if (node.nodeType === 8) {
         const data = (node as Comment).data;
         if (data === markerMatch) {
-          parts.push({type: CHILD_PART, index: nodeIndex});
+          pushPart({type: CHILD_PART, index: nodeIndex});
         } else {
           let i = -1;
           while ((i = (node as Comment).data.indexOf(marker, i + 1)) !== -1) {
             // Comment node has a binding marker inside, make an inactive part
             // The binding won't work, but subsequent bindings will
-            parts.push({type: COMMENT_PART, index: nodeIndex});
+            pushPart({type: COMMENT_PART, index: nodeIndex});
             // Move to the end of the match
             i += marker.length - 1;
           }
@@ -1314,6 +1351,10 @@ type CommentTemplatePart = {
   readonly type: typeof COMMENT_PART;
   readonly index: number;
 };
+type KeyedAttributeTemplatePart = {
+  readonly type: typeof KEYED_ATTRIBUTE_PART;
+  readonly index: number;
+};
 
 /**
  * A TemplatePart represents a dynamic part in a template, before the template
@@ -1324,6 +1365,7 @@ type TemplatePart =
   | ChildTemplatePart
   | AttributeTemplatePart
   | ElementTemplatePart
+  | KeyedAttributeTemplatePart
   | CommentTemplatePart;
 
 export type Part =
@@ -1678,12 +1720,89 @@ class ChildPart implements Disconnectable {
     return template;
   }
 
+  private _getTemplateResultKey(value: unknown): unknown {
+    if ((value as TemplateResult)?.['_$litType$'] === undefined) {
+      return noKey;
+    }
+    const {values, ['_$litType$']: type} = value as TemplateResult;
+    if (typeof type !== 'number') {
+      return noKey;
+    }
+    const template = this._$getTemplate(value as UncompiledTemplateResult);
+    return template.keyedValueIndex === undefined
+      ? noKey
+      : values[template.keyedValueIndex];
+  }
+
+  private _insertPartBeforeEnd(part: ChildPart): void {
+    const parent = wrap(this._$startNode).parentNode!;
+    let node: ChildNode | null = part._$startNode;
+    const end = part._$endNode!;
+    while (node !== null) {
+      const next: ChildNode | null = wrap(node).nextSibling;
+      wrap(parent).insertBefore(node, this._$endNode);
+      if (node === end) {
+        break;
+      }
+      node = next;
+    }
+  }
+
+  private _removePart(part: ChildPart): void {
+    part._$notifyConnectionChanged?.(false, true);
+    let node: ChildNode | null = part._$startNode;
+    const end = part._$endNode!;
+    while (node !== null) {
+      const next: ChildNode | null = wrap(node).nextSibling;
+      wrap(node).remove();
+      if (node === end) {
+        break;
+      }
+      node = next;
+    }
+  }
+
   private _commitIterable(value: Iterable<unknown>): void {
     // For an Iterable, we create a new InstancePart per item, then set its
     // value to the item. This is a little bit of overhead for every item in
     // an Iterable, but it lets us recurse easily and efficiently update Arrays
     // of TemplateResults that will be commonly returned from expressions like:
     // array.map((i) => html`${i}`), by reusing existing TemplateInstances.
+
+    const items = Array.from(value);
+    const keys = items.map((item) => this._getTemplateResultKey(item));
+    const hasKeyedItems = keys.some((key) => key !== noKey);
+    const allItemsKeyed = hasKeyedItems && keys.every((key) => key !== noKey);
+
+    if (allItemsKeyed) {
+      const seen = new Set<unknown>();
+      let hasDuplicateKeys = false;
+      for (const key of keys) {
+        if (seen.has(key)) {
+          hasDuplicateKeys = true;
+          break;
+        }
+        seen.add(key);
+      }
+      if (hasDuplicateKeys) {
+        if (DEV_MODE) {
+          issueWarning(
+            'duplicate-key',
+            'Detected duplicate `:key` values in an iterable. ' +
+              'Falling back to positional updates for this render.'
+          );
+        }
+      } else {
+        this._commitKeyedIterable(items, keys);
+        return;
+      }
+    } else if (DEV_MODE && hasKeyedItems) {
+      issueWarning(
+        'mixed-keyed-iterable',
+        'Detected an iterable with a mix of keyed and unkeyed items. ' +
+          'Falling back to positional updates for this render.'
+      );
+    }
 
     // If value is an array, then the previous render was of an
     // iterable and value will contain the ChildParts from the previous
@@ -1700,7 +1819,7 @@ class ChildPart implements Disconnectable {
     let partIndex = 0;
     let itemPart: ChildPart | undefined;
 
-    for (const item of value) {
+    for (const item of items) {
       if (partIndex === itemParts.length) {
         // If no existing part, create a new one
         // TODO (justinfagnani): test perf impact of always creating two parts
@@ -1731,6 +1850,50 @@ class ChildPart implements Disconnectable {
       // Truncate the parts array so _value reflects the current state
       itemParts.length = partIndex;
     }
+  }
+
+  private _commitKeyedIterable(items: Array<unknown>, keys: Array<unknown>) {
+    if (!isArray(this._$committedValue)) {
+      this._$committedValue = [];
+      this._$clear();
+    }
+
+    const oldParts = this._$committedValue as ChildPart[];
+    const oldPartsByKey = new Map<unknown, ChildPart>();
+    for (const part of oldParts) {
+      if (Object.prototype.hasOwnProperty.call(part, '_$key')) {
+        oldPartsByKey.set((part as ChildPart & {_$key?: unknown})._$key, part);
+      }
+    }
+
+    const newParts: ChildPart[] = [];
+    for (let i = 0; i < items.length; i++) {
+      const key = keys[i];
+      let itemPart = oldPartsByKey.get(key);
+      if (itemPart === undefined) {
+        itemPart = new ChildPart(
+          this._insert(createMarker()),
+          this._insert(createMarker()),
+          this,
+          this.options
+        );
+      } else {
+        oldPartsByKey.delete(key);
+      }
+      (itemPart as ChildPart & {_$key?: unknown})._$key = key;
+      itemPart._$setValue(items[i]);
+      this._insertPartBeforeEnd(itemPart);
+      newParts.push(itemPart);
+    }
+
+    for (const part of oldParts) {
+      if (!newParts.includes(part)) {
+        this._removePart(part);
+      }
+    }
+
+    oldParts.length = 0;
+    oldParts.push(...newParts);
   }
 
   /**

@@ -786,6 +786,82 @@ suite('lit-html', () => {
       render(t(), container);
       assertContent('<div>foo</div>');
     });
+
+    skipTestIfCompiled('reorders keyed template array items', () => {
+      let items = [
+        {id: 1, label: 'a'},
+        {id: 2, label: 'b'},
+        {id: 3, label: 'c'},
+      ];
+      const t = () =>
+        html`<ul>${items.map(
+          (item) => html`<li :key=${item.id}>${item.label}</li>`
+        )}</ul>`;
+
+      render(t(), container);
+      const [a, b, c] = Array.from(container.querySelectorAll('li'));
+      assertContent('<ul><li>a</li><li>b</li><li>c</li></ul>');
+      assert.isFalse(a.hasAttribute(':key'));
+
+      items = [
+        {id: 3, label: 'c!'},
+        {id: 1, label: 'a!'},
+        {id: 2, label: 'b!'},
+      ];
+      render(t(), container);
+      const [c2, a2, b2] = Array.from(container.querySelectorAll('li'));
+      assertContent('<ul><li>c!</li><li>a!</li><li>b!</li></ul>');
+      assert.strictEqual(a2, a);
+      assert.strictEqual(b2, b);
+      assert.strictEqual(c2, c);
+    });
+
+    skipTestIfCompiled('adds and removes keyed template array items', () => {
+      let items = [
+        {id: 'a', label: 'a'},
+        {id: 'b', label: 'b'},
+        {id: 'c', label: 'c'},
+      ];
+      const t = () =>
+        html`<ul>${items.map(
+          (item) => html`<li :key=${item.id}>${item.label}</li>`
+        )}</ul>`;
+
+      render(t(), container);
+      const [, b] = Array.from(container.querySelectorAll('li'));
+
+      items = [
+        {id: 'd', label: 'd'},
+        {id: 'b', label: 'b!'},
+      ];
+      render(t(), container);
+      const [d, b2] = Array.from(container.querySelectorAll('li'));
+      assertContent('<ul><li>d</li><li>b!</li></ul>');
+      assert.notStrictEqual(d, b);
+      assert.strictEqual(b2, b);
+    });
+
+    skipTestIfCompiled('warns on duplicate keyed template array items', () => {
+      if (!DEV_MODE) {
+        return;
+      }
+      const warn = console.warn;
+      const warnings: string[] = [];
+      console.warn = (warning: string) => warnings.push(warning);
+      try {
+        render(
+          html`<ul>${[1, 1].map((id) => html`<li :key=${id}>${id}</li>`)}</ul>`,
+          container
+        );
+      } finally {
+        console.warn = warn;
+      }
+      assert.isTrue(
+        warnings.some((warning) =>
+          warning.includes('Detected duplicate `:key` values')
+        )
+      );
+    });
   });
 
   suite('svg', () => {
